@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Training artefacts
+runs/
+*.npz
+*.sgf
+*.pt
+*.ckpt
+
+# Scratch / leftovers
+.tmp_*/
+.dsh-office-*/
+.pytest_cache/

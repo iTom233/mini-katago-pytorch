@@ -1,0 +1,9 @@
+# KataGo (Wu 2020) — PyTorch reproduction
+#
+# The project runs with NumPy alone (the reference backend); install these for
+# the primary PyTorch backend.
+#
+# torch 2.3 is the first release that accepts NumPy 2.x; older builds fail with
+# "RuntimeError: Numpy is not available" (they were compiled against NumPy 1.x).
+torch>=2.3
+numpy>=1.24
