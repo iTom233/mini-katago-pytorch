@@ -263,6 +263,8 @@ class Trainer:
         steps_per_iteration: int = 50,
         eval_every: int = 0,
         eval_games: int = 10,
+        eval_opening_moves: int = 4,
+        eval_temperature: float = 0.0,
         checkpoint_path: Optional[str] = None,
         best_checkpoint_path: Optional[str] = None,
     ) -> List[IterationStats]:
@@ -354,6 +356,8 @@ class Trainer:
                     win_rate = evaluate_vs_net(
                         self.selfplay_net, opponent, self.rules, games=eval_games,
                         visits=visits, mcts_config=self.mcts_config, rng=self.rng,
+                        opening_moves=eval_opening_moves,
+                        temperature=eval_temperature,
                     )
                 self.log(f"  eval @iter {it}: win rate vs {eval_label} {win_rate:.1%}")
 

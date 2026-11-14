@@ -58,13 +58,53 @@ python scripts/train.py --backend torch --device auto --size 9 --blocks 6 --chan
     --replay-window 200000 --no-gating --eval-every 10 --eval-games 16 \
     --workers 4 --out runs/torch9x9
 
-# 论文配置（需要 GPU；本机 6 GiB 显存跑不动，见 §9）
+# 19x19 单卡（RTX 4050 6 GiB 实测可用，峰值 2.3 GB；详见下面的「19x19 训练」）
+python scripts/train.py --backend torch --device auto --size 19 --blocks 6 --channels 64 \
+    --iterations 500 --games 32 --steps 40 --batch-size 256 --lr 1e-3 --lr-warmup-samples 8000 \
+    --full-cap 150 --fast-cap 40 --full-fraction 0.25 --min-pass-move 100 \
+    --replay-window 32000 --no-gating --eval-every 100 --eval-games 32 \
+    --eval-opponent random --workers 6 --out runs/torch19x19
+
+# 论文配置（20b256c；6 GiB 上只有 368 pos/s，一局 8 分钟，跑不完一轮迭代，见 §9）
 python scripts/train.py --backend torch --size 19 --blocks 20 --channels 256 \
     --iterations 100000 --games 32 --steps 500 --batch-size 256 \
     --full-cap 600 --fast-cap 100 --full-fraction 0.25 --out runs/main19x19
 ```
 
-训练会把两份权重和 `history.json`（loss / 评估曲线）写到 `--out` 目录，两份都是**覆盖式**的：
+#### 19x19 训练
+
+**显存不是瓶颈，时间是。** RTX 4050 Laptop（6 GiB）上 `6b64c` 的实测：
+
+| 指标 | 9x9 `6b64c` | 19x19 `6b64c` |
+|---|---:|---:|
+| 参数量 | 1.27 M | **10.43 M** |
+| 单局（6 workers） | ~1.6 s | **16.3 s** |
+| 32 局 / 轮 | ~50 s | **180~220 s** |
+| 峰值显存（`--workers 6`） | ~4.4 GB（8 worker） | **2.3 GB** |
+| GPU 利用率 | — | 34~47% |
+
+参数量涨了 8 倍，但**全部集中在输出头上**：policy 从 82 维变 362 维、score 从 165 bins 变 725 bins、ownership 从 81 点变 361 点，主干（6×64）一个参数没加。所以 19x19 的 1043 万并不代表更强的表示能力，真正的容量仍是那个约 100 万的主干。
+
+几个必须跟着改的参数：
+
+| 参数 | 9x9 常用 | 19x19 建议 | 原因 |
+|---|---|---|---|
+| `--workers` | 8 | **6** | 瓶颈在 CPU 侧的 MCTS 树操作，GPU 只用 40%，加 worker 未必更快 |
+| `--batch-size` | 256 | 256（128 更保险） | 激活值随棋盘面积线性增长 |
+| `--min-pass-move` | 40 | **100** | 一局约 250 手，40 手就允许 pass 太早 |
+| `--replay-window` | 16 000 | **32 000** | 每轮只产约 1 700 个样本，窗口要能装 15~20 轮 |
+| `--lr-warmup-samples` | 3 000 | **8 000** | 单样本更贵，热身期要相应拉长 |
+
+`--eval-opponent random` 只在早期有用：30~50 轮后胜率就会饱和到 95% 以上、失去分辨力，此后应指向上一代的权重（每代只和紧邻的上一代比，胜率才会落在可分辨的 50~70% 区间）：
+
+```bash
+python scripts/train.py ... --resume runs/torch19x19_v1/model.npz \
+    --eval-opponent runs/torch19x19_v1/model.npz --out runs/torch19x19_v2
+```
+
+**时间预算**：500 轮约 25~31 小时（3 天以内）。距野狐 1d 的粗估是 30 万~60 万盘自对弈，6 GiB 单卡需要 2~4 个月连续运行——这条路的价值在“每一步都可观测”，不在最终棋力。
+
+不论棋盘尺寸，训练都会把两份权重和 `history.json`（loss / 评估曲线）写到 `--out` 目录，两份都是**覆盖式**的：
 
 | 文件 | 写入时机 |
 |---|---|
@@ -416,7 +456,7 @@ n_forced(c) = ( k · P(c) · Σ N(c') )^(1/2)
 
 | # | 偏差 | 原因 / 影响 |
 |---|---|---|
-| 1 | **torch 路径只在小规模上验证过** | torch 2.6.0+cu118 / RTX 4050 6 GiB 上已验证：`tests/test_torch_model.py` 7 项全过，9×9 中等网络能完整训练。论文级配置（19×19、`20×256`、600 playouts）没跑过：实测该网络只有 368 pos/s，一局要 8 分钟，本机跑不完一轮迭代 |
+| 1 | **torch 路径只在中小规模上验证过** | torch 2.6.0+cu118 / RTX 4050 6 GiB 上已验证：`tests/test_torch_model.py` 7 项全过，9×9 与 19×19 的 `6b64c` 都能完整训练（19×19 单局 16.3 s @ 6 workers，峰值 2.3 GiB）。论文级配置（`20×256`、600 playouts）没跑过：该网络只有 368 pos/s，一局要 8 分钟，本机跑不完一轮迭代 |
 | 2 | **NumPy 后端没有 BatchNorm** | 自动微分的范围控制。NumPy 后端与 torch 拓扑一致（pre-act 残差 + 全局池化偏置 + 多输出头），仅去掉 BN；它只用于验证流水线，不追求棋力 |
 | 3 | **ownership 损失的权重换算** | 论文对 `b²` 个点**求和**并乘 `1.5/b²`；本实现对点**取平均**，因此 `1.5/b²` 的分母与之抵消，实际权重为 1.5。见 `LossConfig.w_ownership` |
 | 4 | **score cdf 损失按论文公式无法成立** | 论文写作 `Σ_x (Σ_{y<x} p_s(y)·p̂_s(y))²`，这在 `p_s` 是 one-hot 时退化为"真实分数之上的 bin 数 × p̂(x*)²"，不是合理的损失。本实现采用显然的意图：**预测 CDF 与真实 CDF 的平方误差** |
@@ -579,12 +619,15 @@ PyTorch 后端在 RTX 4050（6 GiB, 20 SMs）上的实测：
 | 9×9 `4b32c` | 2717 pos/s | 未测 | 0.05 GiB |
 | 9×9 `6b64c` | 2195 pos/s | 30 ms @128 | 0.18 GiB |
 | 13×13 `6b64c` | 2341 pos/s | 41 ms @128 | 0.27 GiB |
+| 19×19 `6b64c` | 未单独测 | 未测 | 2.3 GiB（`--workers 6` 自对弈） |
 | 19×19 `10b128c` | 1537 pos/s | 266 ms @128 | 1.51 GiB |
 | 19×19 `20b256c`（论文） | 368 pos/s | 615 ms @64 | 2.96 GiB |
 
 **自对弈的瓶颈不在 GPU。** 一次 9×9 / `6b64c` / cap 100/25（25% 全搜索）的自对弈里，
 `legal_mask` 与 `encode_position` 合计约占 60%，网络前向只占 10%，其余是搜索本身
-的 Python 开销。按 profile 结果做了四项优化：
+的 Python 开销。19×19 上结论一样：`--workers 6` 跑自对弈时 GPU 利用率只有 34~47%、
+功耗 11 W（上限 40 W），显存也只用掉 2.3 GB——多开 worker 收益递减，真正的瓶颈在 CPU。
+按 profile 结果做了四项优化：
 
 1. `Position` 构造时只算一次棋盘 hash（原来 `_hash` 和 `_hash_stack_board` 各算一遍）；
 2. `is_legal` 在**没有提子**时直接返回合法，跳过 superko 的全盘 hash —— 不提子的

@@ -79,7 +79,29 @@ def parse_args(argv=None):
                    help="refresh the self-play network every iteration instead of "
                         "using the SWA + gating pipeline (useful for short runs)")
     p.add_argument("--eval-every", type=int, default=5, help="0 disables evaluation")
-    p.add_argument("--eval-games", type=int, default=10)
+    p.add_argument(
+        "--eval-games",
+        type=int,
+        default=10,
+        help="games per evaluation; the 95%% confidence interval is roughly "
+        "+/-16%% at 10 games, +/-6%% at 64 and +/-3.5%% at 200",
+    )
+    p.add_argument(
+        "--eval-opening-moves",
+        type=int,
+        default=4,
+        help="random opening moves in eval games. Search is deterministic, so "
+        "without this every game between the same two nets is a replay of one "
+        "position per colour and the reported win rate can only be "
+        "0%%, 50%% or 100%%",
+    )
+    p.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=0.0,
+        help="sample eval moves at this temperature instead of playing the top "
+        "move (0 = greedy; >0 adds variety but lowers playing strength)",
+    )
     p.add_argument("--eval-opponent", default="random",
                    help="'random' (uniform legal moves) or a checkpoint path to "
                         "evaluate against, e.g. runs/old/model.npz. A path is loaded "
@@ -198,6 +220,8 @@ def main(argv=None) -> int:
             steps_per_iteration=args.steps,
             eval_every=args.eval_every,
             eval_games=args.eval_games,
+            eval_opening_moves=args.eval_opening_moves,
+            eval_temperature=args.eval_temperature,
             checkpoint_path=ckpt,
             best_checkpoint_path=best_ckpt,
         )

@@ -13,6 +13,8 @@ runs/
 *.sgf
 *.pt
 *.ckpt
+*.log
+.ckpt-*/
 
 # Scratch / leftovers
 .tmp_*/

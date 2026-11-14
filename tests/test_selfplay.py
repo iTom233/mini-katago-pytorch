@@ -240,6 +240,32 @@ def test_evaluate_vs_net_reports_a_rate():
     assert rate in (0.0, 0.5, 1.0)
 
 
+def test_random_opening_is_seeded_and_legal():
+    """The opening must replay from a seed and must be a real opening."""
+    from katago.selfplay.gating import _random_opening
+
+    rules = Rules(size=9, komi=7.5)
+    a = _random_opening(Position.empty(rules), np.random.default_rng(1), 4)
+    b = _random_opening(Position.empty(rules), np.random.default_rng(1), 4)
+    c = _random_opening(Position.empty(rules), np.random.default_rng(2), 4)
+
+    assert np.array_equal(a.grid, b.grid), "same seed must replay the same opening"
+    assert not np.array_equal(a.grid, c.grid), "different seeds must differ"
+    assert np.count_nonzero(a.grid) == 4, "four opening stones were requested"
+    assert a.to_play == BLACK, "black plays the odd-numbered opening moves"
+
+
+def test_match_game_accepts_opening_and_temperature():
+    """Guards the argument plumbing used by the evaluator."""
+    net = small_net()
+    rules = Rules(size=9, komi=7.5)
+    result = play_match_game(
+        net, net, rules, fast_mcts(), visits=4,
+        rng=np.random.default_rng(0), opening_moves=2, temperature=1.0,
+    )
+    assert result in (0, 1, 2)
+
+
 def test_trainer_loads_a_frozen_eval_opponent():
     """A checkpoint path given to the trainer is loaded once and reused."""
     import os

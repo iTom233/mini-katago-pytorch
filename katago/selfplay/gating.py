@@ -54,6 +54,20 @@ def _quiet_config(base: MCTSConfig) -> MCTSConfig:
     )
 
 
+def _random_opening(
+    position: Position, rng: np.random.Generator, moves: int
+) -> Position:
+    """Play up to ``moves`` uniformly random legal moves from ``position``."""
+    for _ in range(max(0, moves)):
+        if position.is_terminal:
+            break
+        legal = position.legal_moves()
+        if not legal:
+            break
+        position = position.play(int(rng.choice(legal)))
+    return position
+
+
 def play_match_game(
     black: BaseNet,
     white: BaseNet,
@@ -62,19 +76,35 @@ def play_match_game(
     visits: int = 32,
     max_moves: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
+    opening_moves: int = 0,
+    temperature: float = 0.0,
 ) -> int:
-    """Play one game; returns 1 if Black won, 2 if White won, 0 for a draw."""
+    """Play one game; returns 1 if Black won, 2 if White won, 0 for a draw.
+
+    Both nets search deterministically (``add_noise=False`` and a greedy
+    read-out), so without extra randomness every game between the same two
+    weight sets is a byte-for-byte replay and a large match carries almost no
+    statistical signal.
+
+    ``opening_moves`` plays that many uniformly random legal moves first, which
+    is the cheapest way to decorrelate the games: four random stones on 9x9
+    already give tens of millions of distinct starting positions, and both
+    sides get the same treatment so the comparison stays fair.
+
+    ``temperature > 0`` additionally samples every move from the visit counts
+    instead of taking the argmax -- more variety, slightly weaker play.
+    """
     cfg = _quiet_config(mcts_config or MCTSConfig())
     rng = rng or np.random.default_rng()
-    position = Position.empty(rules)
+    position = _random_opening(Position.empty(rules), rng, opening_moves)
     limit = max_moves or rules.max_moves
-    moves = 0
+    moves = min(opening_moves, rules.max_moves)
     while not position.is_terminal and moves < limit:
         net = black if position.to_play == 1 else white
         mcts = MCTS(net, cfg, batch_size=8, rng=rng)
         mcts.set_root(position, add_noise=False)
         mcts.run(visits)
-        move = mcts.best_move(temperature=0.0)
+        move = mcts.sample_move(temperature)
         position = position.play(move)
         moves += 1
     if position.is_draw:
@@ -95,11 +125,14 @@ def gating_test(
     mcts_config: Optional[MCTSConfig] = None,
     rng: Optional[np.random.Generator] = None,
     progress=None,
+    opening_moves: int = 0,
+    temperature: float = 0.0,
 ) -> Tuple[bool, MatchResult]:
     """Play ``games`` games alternating colours; accept if ``wins_needed`` reached.
 
     Defaults to the strictest interpretation of Wu 2020 (50% + ties broken by the
-    incumbent, i.e. the candidate must not lose).
+    incumbent, i.e. the candidate must not lose).  ``opening_moves`` and
+    ``temperature`` are forwarded to :func:`play_match_game`.
     """
     rng = rng or np.random.default_rng()
     if wins_needed is None:
@@ -107,11 +140,17 @@ def gating_test(
     wins = losses = draws = 0
     for g in range(games):
         if g % 2 == 0:
-            result = play_match_game(candidate, current, rules, mcts_config, visits, rng=rng)
+            result = play_match_game(
+                candidate, current, rules, mcts_config, visits, rng=rng,
+                opening_moves=opening_moves, temperature=temperature,
+            )
             candidate_won = result == 1
             candidate_lost = result == 2
         else:
-            result = play_match_game(current, candidate, rules, mcts_config, visits, rng=rng)
+            result = play_match_game(
+                current, candidate, rules, mcts_config, visits, rng=rng,
+                opening_moves=opening_moves, temperature=temperature,
+            )
             candidate_won = result == 2
             candidate_lost = result == 1
         if result == 0:
@@ -139,22 +178,34 @@ def evaluate_vs_net(
     visits: int = 32,
     mcts_config: Optional[MCTSConfig] = None,
     rng: Optional[np.random.Generator] = None,
+    opening_moves: int = 0,
+    temperature: float = 0.0,
 ) -> float:
     """Win rate of ``net`` against another network, alternating colours.
 
     Both sides search with the same ``visits`` budget, so the score compares the
     two weight sets rather than their search settings.  Draws count as half a
     win, matching :func:`evaluate_vs_random`.
+
+    ``opening_moves`` matters here: deterministic search would make all
+    ``games`` a replay of the same two positions (one per colour), so the win
+    rate could only ever come out as 0%, 50% or 100%.
     """
     rng = rng or np.random.default_rng()
     wins = 0.0
     for g in range(games):
         net_is_black = g % 2 == 0
         if net_is_black:
-            result = play_match_game(net, opponent, rules, mcts_config, visits, rng=rng)
+            result = play_match_game(
+                net, opponent, rules, mcts_config, visits, rng=rng,
+                opening_moves=opening_moves, temperature=temperature,
+            )
             wins += 1.0 if result == 1 else (0.5 if result == 0 else 0.0)
         else:
-            result = play_match_game(opponent, net, rules, mcts_config, visits, rng=rng)
+            result = play_match_game(
+                opponent, net, rules, mcts_config, visits, rng=rng,
+                opening_moves=opening_moves, temperature=temperature,
+            )
             wins += 1.0 if result == 2 else (0.5 if result == 0 else 0.0)
     return wins / games
 
