@@ -60,9 +60,9 @@ python scripts/train.py --backend torch --device auto --size 9 --blocks 6 --chan
 
 # 19x19 单卡（RTX 4050 6 GiB 实测可用，峰值 2.3 GB；详见下面的「19x19 训练」）
 python scripts/train.py --backend torch --device auto --size 19 --blocks 6 --channels 64 \
-    --iterations 500 --games 32 --steps 40 --batch-size 256 --lr 1e-3 --lr-warmup-samples 8000 \
-    --full-cap 150 --fast-cap 40 --full-fraction 0.25 --min-pass-move 100 \
-    --replay-window 32000 --no-gating --eval-every 100 --eval-games 32 \
+    --iterations 100 --games 32 --steps 40 --batch-size 512 --lr 1e-3 --lr-warmup-samples 8000 \
+    --full-cap 600 --fast-cap 40 --full-fraction 0.25 --min-pass-move 100 \
+    --replay-window 32000 --no-gating --eval-every 25 --eval-games 16 \
     --eval-opponent random --workers 6 --out runs/torch19x19
 
 # 论文配置（20b256c；6 GiB 上只有 368 pos/s，一局 8 分钟，跑不完一轮迭代，见 §9）
@@ -73,15 +73,20 @@ python scripts/train.py --backend torch --size 19 --blocks 20 --channels 256 \
 
 #### 19x19 训练
 
-**显存不是瓶颈，时间是。** RTX 4050 Laptop（6 GiB）上 `6b64c` 的实测：
+**显存不是瓶颈，CPU 才是。** RTX 4050 Laptop（6 GiB）上 `6b64c` 的实测：
 
-| 指标 | 9x9 `6b64c` | 19x19 `6b64c` |
+| 指标 | 9x9 `6b64c`（150/40） | 19x19 `6b64c`（600/40） |
 |---|---:|---:|
 | 参数量 | 1.27 M | **10.43 M** |
-| 单局（6 workers） | ~1.6 s | **16.3 s** |
-| 32 局 / 轮 | ~50 s | **180~220 s** |
+| 单局（6 workers） | ~1.6 s | **~170 s** |
+| 32 局 / 轮 | ~50 s | **~900 s 起**；CPU 被别的程序争用时到过 2 800 s |
 | 峰值显存（`--workers 6`） | ~4.4 GB（8 worker） | **2.3 GB** |
 | GPU 利用率 | — | 34~47% |
+
+`--full-cap` 从 9x9 的 150 提到 600，原因是搜索够不够看的是 **visits / 候选数**，不是 visits 本身。
+9x9 有 82 个点，150 visits 平均每点 1.8 次；19x19 有 362 个点，同样 150 次只有 0.4 次——MCTS 来不及把
+候选区分开，π 基本等于网络自己的先验 P，训练就退化成"自己教自己"。600 是把覆盖率平移回 9x9 的量级。
+`--fast-cap` 留在 40 不算妥协：fast 回合只负责把棋走下去，不产出样本，算力该集中在占 25% 的 full 回合上。
 
 参数量涨了 8 倍，但**全部集中在输出头上**：policy 从 82 维变 362 维、score 从 165 bins 变 725 bins、ownership 从 81 点变 361 点，主干（6×64）一个参数没加。所以 19x19 的 1043 万并不代表更强的表示能力，真正的容量仍是那个约 100 万的主干。
 
@@ -89,10 +94,11 @@ python scripts/train.py --backend torch --size 19 --blocks 20 --channels 256 \
 
 | 参数 | 9x9 常用 | 19x19 建议 | 原因 |
 |---|---|---|---|
+| `--full-cap` | 150 | **600** | 362 个候选，150 visits 的覆盖率只有 9x9 的 1/4 |
 | `--workers` | 8 | **6** | 瓶颈在 CPU 侧的 MCTS 树操作，GPU 只用 40%，加 worker 未必更快 |
-| `--batch-size` | 256 | 256（128 更保险） | 激活值随棋盘面积线性增长 |
-| `--min-pass-move` | 40 | **100** | 一局约 250 手，40 手就允许 pass 太早 |
-| `--replay-window` | 16 000 | **32 000** | 每轮只产约 1 700 个样本，窗口要能装 15~20 轮 |
+| `--batch-size` | 256 | **512** | `6×64` 的激活只有约 1.1 GB，512 仍很富裕；256×40 步对每轮 1 500~3 000 的产出只有 3~5 倍复用 |
+| `--min-pass-move` | 40 | **100** | 实测一局 200~340 手，40 手就允许 pass 太早 |
+| `--replay-window` | 16 000 | **32 000** | 每轮产 1 500~3 000 个样本，窗口覆盖 11~21 轮 |
 | `--lr-warmup-samples` | 3 000 | **8 000** | 单样本更贵，热身期要相应拉长 |
 
 `--eval-opponent random` 只在早期有用：30~50 轮后胜率就会饱和到 95% 以上、失去分辨力，此后应指向上一代的权重（每代只和紧邻的上一代比，胜率才会落在可分辨的 50~70% 区间）：
@@ -102,7 +108,9 @@ python scripts/train.py ... --resume runs/torch19x19_v1/model.npz \
     --eval-opponent runs/torch19x19_v1/model.npz --out runs/torch19x19_v2
 ```
 
-**时间预算**：500 轮约 25~31 小时（3 天以内）。距野狐 1d 的粗估是 30 万~60 万盘自对弈，6 GiB 单卡需要 2~4 个月连续运行——这条路的价值在“每一步都可观测”，不在最终棋力。
+**时间预算**：按每轮 900~1 800 s 算，100 轮要 25~50 小时。**先跑 100 轮，用第一轮的实测耗时推算后续**，
+别在知道速度之前就定死 500 轮。距野狐 1d 的粗估是 30 万~60 万盘自对弈，单卡需要 2~4 个月连续运行——
+这条路的价值在“每一步都可观测”，不在最终棋力。
 
 不论棋盘尺寸，训练都会把两份权重和 `history.json`（loss / 评估曲线）写到 `--out` 目录，两份都是**覆盖式**的：
 
@@ -163,11 +171,71 @@ python scripts/train.py ... \
 
 日志里会写成 `eval @iter 99: win rate vs model.npz 63.0%`，稳定高于 50% 才说明新模型更强。
 
+#### 云端训练（Linux）
+
+租用 GPU 时最要紧的不是参数，而是**让训练活过 SSH 断线**。直接在登录 shell 里前台启动，
+网络一抖就全没了：
+
+- SSH 断开时终端给前台进程组发 `SIGHUP`，python 直接退出
+- 如果还套了 `| tee`，tee 写终端失败会拿到 `SIGPIPE`，python 连 checkpoint 都来不及存
+
+`nohup` 能挡住 `SIGHUP`，但拿不回实时输出、也不能中途 Ctrl+C。**tmux 两者兼顾**：
+
+```bash
+# 一次性离开终端也能跑；实例只要处于「运行中」就一直计费运行
+tmux new -s train
+
+# 在会话里启动，tee 让屏幕和文件同时有输出
+python -u scripts/train.py --backend torch --device auto --size 19 --blocks 6 --channels 64 \
+    --iterations 100 --games 32 --steps 40 --batch-size 512 --lr 1e-3 --lr-warmup-samples 8000 \
+    --full-cap 600 --fast-cap 40 --full-fraction 0.25 --min-pass-move 100 \
+    --replay-window 32000 --no-gating --eval-every 25 --eval-games 16 \
+    --workers 6 --out runs/19x19_v1 2>&1 | tee runs/19x19_v1/train.log
+```
+
+看到 `self-play pool: 6 worker processes` 之后按 `Ctrl+B`、松开再按 `D` 脱离。回来用 `tmux attach -t train`，
+想停就在会话里 `Ctrl+C`——走的和本机一样，会正常写 checkpoint。`nohup` 也可以，但需要
+`kill -INT <pid>` 才能触发保存（`kill -9` 会跳过 checkpoint 写盘）。
+
+跑之前确认两件事：
+
+| 项 | 说明 |
+|---|---|
+| 目录存在 | `mkdir -p runs/19x19_v1`；`tee` 和 `>` 都是 shell 在启动 python **之前**打开的，建目录晚了会直接失败 |
+| 盘位 | AutoDL 的系统盘只给 30 G，数据盘 `/root/autodl-tmp` 更大更快；代码放系统盘（能随镜像保存），`runs/` 放数据盘 |
+
+Pascal 架构的卡（1080 Ti / 1080 / Titan X）**只能用 FP32**：它们的 FP16 是 1/64 速率。本项目没有
+`autocast`，全程 FP32，所以不受影响，但要锁定 `torch==2.6.0 --index-url https://download.pytorch.org/whl/cu118`——
+更新的版本可能不再提供 `sm_61` 的预编译 wheel。
+
+**续训必须让起点和对手同代**，否则评估没有意义（对 `random` 会在 50 轮内饱和到 95% 以上）。
+在上面那条命令上加两个参数，`--lr-warmup-samples` 同步降到 3000（训练过的网络不需要长爬坡）：
+
+```bash
+--resume runs/19x19_v1/model.npz --eval-opponent runs/19x19_v1/model.npz \
+    --lr-warmup-samples 3000 --out runs/19x19_v2
+```
+
+第一轮 eval 因此应该接近 50%，之后每一点涨幅都是真实的。注意 `--resume` 只恢复权重，
+**不恢复 replay buffer**，所以续训头 20 轮（32000 ÷ 每轮样本）loss 会抖——那是缓冲区从空到满的过渡。
+
+云端实例被释放后磁盘不保留，按小时计费时记得把权重拉回本地：
+
+```bash
+scp user@host:~/code/mini-katago-pytorch/runs/19x19_v1/model.npz ./backup_19x19_v1.npz
+```
+
+`model.npz` 每 10% 迭代写一次，所以即使漏备份，最多丢 10 轮。**SSH 断线不影响训练，主动「关机」会**：
+nohup 和 tmux 都挡不住实例停机，只能用余额和备份兜底。
+
 ### 对弈
 
 ```bash
 # 图形界面（鼠标落子，Tkinter，无需额外依赖）
 python scripts/gui.py --checkpoint runs/demo9x9/model.npz --visits 200
+
+# 打开就用分析模式（打谱 + 实时分析）
+python scripts/gui.py --checkpoint runs/demo9x9/model.npz --mode analyze --visits 2000
 
 # 人机对弈（终端棋盘）
 python scripts/play.py --checkpoint runs/demo9x9/model.npz --size 9 --visits 200
@@ -194,10 +262,46 @@ python scripts/play.py --checkpoint runs/demo9x9/model.npz --self \
 采样权重是 `N ** (1 / T)`：`T=1` 时一选 42%、二选 42% 就是一个真正的 50/50；
 `T=0.5` 时权重变成 `N²`，一选压倒性领先。输出里带 `(sampled)` 的着手就是采样所得。
 
-GUI 支持鼠标落子、悔棋、Pass、认输、切换执子、调整搜索量，以及基于
-ownership 头的实时形势图；引擎在后台线程搜索，窗口不会卡住。
-`--backend auto` 会跟随 checkpoint 记录的训练后端，因此 NumPy 训练的权重
-不会被误交给 PyTorch 加载。
+GUI 有两种模式，用「模式」开关切换，切换时保留当前棋局：
+
+- **对弈**：鼠标落子、悔棋、Pass、认输、切换执子、调整搜索量，以及基于
+  ownership 头的实时形势图。
+- **分析**：双方自由落子打谱，引擎报告一选到十选的选点、访问量、胜率与目差；
+  「分析量」可填任意 visit 上限，搜索过程中候选排名和数值边搜边刷新（棋盘上
+  以蓝色数字标出前十），到达上限后自动停住并保留结果。按「停止」可提前结束，
+  落子则立即按当前上限重新分析。
+
+引擎在后台线程搜索，窗口不会卡住；`--backend auto` 会跟随 checkpoint 记录
+的训练后端，因此 NumPy 训练的权重不会被误交给 PyTorch 加载。
+
+窗口可以自由拖拽缩放，棋盘会跟着取窗口里最大的正方形，拖到停下才重绘；
+`F11` 在窗口化和全屏之间切换，`Esc` 退出全屏。侧栏宽度不变，窗口最窄时
+会保证分析面板（十个候选 + 信息区）完整显示。
+
+侧栏是一整块白色卡片配一条发丝边，浮在浅灰底上：标题旁的小标签标出后端，
+设置项按左侧灰色列名对齐，主操作（新对局 / 重新分析）是蓝色实心按钮，其余
+是浅灰描边按钮，悔棋清谱这类不可逆操作单独用红色；最下面的状态卡带一条
+竖色条，思考中变蓝、终局变红。候选表隔行浅底，前三名加粗。
+
+外观在侧栏的「棋盘」「棋子」两个下拉里切换，切换只重绘画布，棋局和正在跑的
+搜索都不受影响；也可以在启动时指定：
+
+```bash
+python scripts/gui.py --checkpoint runs/demo9x9/model.npz \
+    --board-style space --stone-style gem
+```
+
+- 棋盘：`wood` 暖色木纹、`stone` 灰色石材带斑点与石纹、`space` 深蓝星野
+  （星云 + 两层星点）。纹理由固定种子生成，缩放窗口后图案保持一致。
+- 棋子：`classic` 黑白、`gem` 玛瑙（红棕纹路）与翡翠（淡绿）。棋子用
+  「边缘 → 暗环 → 主体 → 左上高光 → 右下反光」几层同心圆叠出球面感，
+  下面再压两层投影，投影颜色跟随棋盘主题。
+
+落子声是 `katago/assets/stone_click.wav` 里的实录声（单声道 16-bit PCM，
+约 0.2 秒）。侧栏「落子声」勾选可随时开关，`--no-sound` 则启动即为静音，
+Pass 不出声。Windows 用 `winsound` 异步播放，macOS 调系统自带的 `afplay`，
+其它平台退化为窗口提示音。录音缺失时会退回标准库实时合成的木盘「嗒」声，
+所以文件丢了也不影响落子。
 
 ### 接图形界面（GTP）
 
@@ -249,14 +353,17 @@ katago/
 │   ├── gating.py         门控测试（候选网络 vs 当前网络）
 │   └── trainer.py        训练闭环：SWA、门控、渐进加宽、学习率调度
 ├── inference/
-│   ├── engine.py         analyze() / genmove()
+│   ├── engine.py         analyze() / genmove() / AnalysisSession 增量分析
 │   └── gtp.py            GTP 前端
-└── utils/
-    ├── symmetry.py       8 种二面体变换
-    └── sgf.py            SGF 导出
+├── utils/
+│   ├── symmetry.py       8 种二面体变换
+│   ├── sgf.py            SGF 导出
+│   └── sound.py          落子声：优先播 assets 里的录音，缺失则实时合成
+└── assets/
+    └── stone_click.wav   实录落子声（单声道 16-bit PCM，约 0.2 秒）
 
 scripts/   train.py  play.py  gtp.py  gui.py  benchmark.py
-tests/     run_tests.py + 9 个测试模块（107 项）
+tests/     run_tests.py + 10 个测试模块（118 项）
 ```
 
 ---
@@ -456,7 +563,7 @@ n_forced(c) = ( k · P(c) · Σ N(c') )^(1/2)
 
 | # | 偏差 | 原因 / 影响 |
 |---|---|---|
-| 1 | **torch 路径只在中小规模上验证过** | torch 2.6.0+cu118 / RTX 4050 6 GiB 上已验证：`tests/test_torch_model.py` 7 项全过，9×9 与 19×19 的 `6b64c` 都能完整训练（19×19 单局 16.3 s @ 6 workers，峰值 2.3 GiB）。论文级配置（`20×256`、600 playouts）没跑过：该网络只有 368 pos/s，一局要 8 分钟，本机跑不完一轮迭代 |
+| 1 | **torch 路径只在中小规模上验证过** | torch 2.6.0+cu118 / RTX 4050 6 GiB 上已验证：`tests/test_torch_model.py` 7 项全过，9×9 与 19×19 的 `6b64c` 都能完整训练（19×19 在 `--full-cap 600 --fast-cap 40` 下单局约 170 s @ 6 workers，峰值 2.3 GiB）。论文级配置（`20×256`、全手 600 playouts）没跑过：该网络只有 368 pos/s，一局要 8 分钟，本机跑不完一轮迭代 |
 | 2 | **NumPy 后端没有 BatchNorm** | 自动微分的范围控制。NumPy 后端与 torch 拓扑一致（pre-act 残差 + 全局池化偏置 + 多输出头），仅去掉 BN；它只用于验证流水线，不追求棋力 |
 | 3 | **ownership 损失的权重换算** | 论文对 `b²` 个点**求和**并乘 `1.5/b²`；本实现对点**取平均**，因此 `1.5/b²` 的分母与之抵消，实际权重为 1.5。见 `LossConfig.w_ownership` |
 | 4 | **score cdf 损失按论文公式无法成立** | 论文写作 `Σ_x (Σ_{y<x} p_s(y)·p̂_s(y))²`，这在 `p_s` 是 one-hot 时退化为"真实分数之上的 bin 数 × p̂(x*)²"，不是合理的损失。本实现采用显然的意图：**预测 CDF 与真实 CDF 的平方误差** |

@@ -1,9 +1,13 @@
-"""Saved models, SGF export and the progressive-widening schedule."""
+"""Saved models, SGF export, the stone click and the widening schedule."""
 
 from __future__ import annotations
 
+import array
+import io
 import os
 import shutil
+import sys
+import wave
 
 import numpy as np
 
@@ -12,6 +16,13 @@ from katago.nn.config import MCTSConfig, NetConfig, PlayoutCapConfig, TrainConfi
 from katago.nn.numpy_net import NumpyNet
 from katago.selfplay.trainer import Trainer
 from katago.utils.sgf import to_sgf
+from katago.utils.sound import (
+    ASSET_PATH,
+    CLICK_SAMPLE_RATE,
+    CLICK_SECONDS,
+    prepare_click,
+    render_click,
+)
 
 
 def quick_caps() -> PlayoutCapConfig:
@@ -47,6 +58,44 @@ def test_sgf_result_and_comment():
     sgf = to_sgf([0], 9, result="B+7.5", comment="self-play")
     assert "RE[B+7.5]" in sgf
     assert "C[self-play]" in sgf
+
+
+def test_bundled_stone_click_is_ready_to_play():
+    # winsound needs uncompressed PCM; a wrapped mp3 would fail at play time
+    assert os.path.exists(ASSET_PATH), f"missing recorded click: {ASSET_PATH}"
+    with wave.open(ASSET_PATH) as fh:
+        assert fh.getcomptype() == "NONE", "the click must be uncompressed PCM"
+        assert fh.getsampwidth() == 2, "expected 16-bit samples"
+        seconds = fh.getnframes() / fh.getframerate()
+    assert 0.1 < seconds < 1.5, f"recorded click is {seconds:.2f}s"
+    assert prepare_click() == ASSET_PATH, "the recording should win over the fallback"
+
+
+def test_fallback_click_is_audible_and_decays():
+    # only used when katago/assets/stone_click.wav is missing
+    data = render_click()
+    with wave.open(io.BytesIO(data)) as fh:
+        assert fh.getnchannels() == 1
+        assert fh.getsampwidth() == 2
+        assert fh.getframerate() == CLICK_SAMPLE_RATE
+        count = fh.getnframes()
+        raw = fh.readframes(count)
+    assert count == int(CLICK_SAMPLE_RATE * CLICK_SECONDS)
+    samples = array.array("h")
+    samples.frombytes(raw)
+    if sys.byteorder == "big":
+        samples.byteswap()
+    peak = max(abs(s) for s in samples)
+    assert 8000 < peak < 32767, f"click peak {peak} should be loud but not clipped"
+    ten_ms = int(CLICK_SAMPLE_RATE * 0.01)
+    head = sum(abs(s) for s in samples[:ten_ms]) / ten_ms
+    tail = sum(abs(s) for s in samples[-2 * ten_ms:]) / (2 * ten_ms)
+    assert head > tail * 20, f"no decay: head {head:.0f} vs tail {tail:.0f}"
+    # the "tock" must still be ringing 40-100 ms in; a tiny tick would be gone
+    mid_lo = int(CLICK_SAMPLE_RATE * 0.04)
+    mid_hi = int(CLICK_SAMPLE_RATE * 0.10)
+    mid = sum(abs(s) for s in samples[mid_lo:mid_hi]) / (mid_hi - mid_lo)
+    assert mid > head * 0.3, f"click dies too fast: head {head:.0f} mid {mid:.0f}"
 
 
 def test_progressive_widening_promotes_a_larger_net():

@@ -14,6 +14,9 @@ Implements, with the paper's section numbers:
   back out of the training target, decoupling it from MCTS exploration.
 * **Playout cap randomization** (Section 3.1) is driven by the caller
   (see :mod:`katago.selfplay.worker`), which picks the per-turn cap.
+
+Every node also averages the score belief of the evaluations it collects, so the
+analysis GUI can show a score estimate per candidate move next to the win rate.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..game import PASS_MOVE, Position
+from ..game import BLACK, PASS_MOVE, Position
 from ..game.features import encode_position
 from ..nn.config import MCTSConfig
 from ..nn.base import BaseNet
@@ -35,6 +38,7 @@ class Node:
         "prior",
         "visits",
         "value_sum",
+        "score_sum",
         "children",
         "is_expanded",
         "is_terminal",
@@ -55,6 +59,7 @@ class Node:
         self.prior = float(prior)
         self.visits = 0
         self.value_sum = 0.0
+        self.score_sum = 0.0
         self.children: Dict[int, "Node"] = {}
         self.is_expanded = False
         self.is_terminal = False
@@ -71,6 +76,13 @@ class Node:
             return 0.0
         return self.value_sum / self.visits
 
+    @property
+    def mean_score(self) -> float:
+        """Mean score estimate, in points, from ``to_play``'s perspective."""
+        if self.visits <= 0:
+            return 0.0
+        return self.score_sum / self.visits
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<Node move={self.move} N={self.visits} Q={self.mean_value:+.3f}>"
 
@@ -85,6 +97,12 @@ def terminal_value_of(position: Position) -> float:
         return 0.0
     winner = 1 if black_won else 2
     return 1.0 if winner == position.to_play else -1.0
+
+
+def terminal_score_of(position: Position, to_play: int) -> float:
+    """Area score in points for ``to_play`` at a finished game."""
+    score = position.score()  # Black's perspective
+    return score if to_play == BLACK else -score
 
 
 class MCTS:
@@ -103,7 +121,11 @@ class MCTS:
         self.rng = rng or np.random.default_rng()
         self.root: Optional[Node] = None
         self.root_value: float = 0.0
+        self.root_score: float = 0.0
         self._forced_targets: Dict[int, float] = {}
+        self._score_bins = (
+            np.arange(net.config.score_bins, dtype=np.float64) - net.config.score_offset
+        )
 
     # ------------------------------------------------------------------ setup
     def set_root(self, position: Position, add_noise: bool = True) -> None:
@@ -136,7 +158,9 @@ class MCTS:
         self._expand(self.root, probs, is_root=True)
         self.root.visits = 1
         self.root.value_sum = float(out.value[0, 1] - out.value[0, 0])
+        self.root.score_sum = float(np.dot(out.score[0], self._score_bins))
         self.root_value = self.root.value_sum
+        self.root_score = self.root.score_sum
         self._compute_forced_targets()
 
     def _compute_forced_targets(self) -> None:
@@ -233,15 +257,25 @@ class MCTS:
             node = child
 
     # ----------------------------------------------------------------- backup
-    def _backup(self, path: List[Tuple[Node, Node]], leaf: Node, value: float) -> None:
-        """Propagate ``value`` (from ``leaf.to_play``'s perspective) up the path."""
+    def _backup(
+        self,
+        path: List[Tuple[Node, Node]],
+        leaf: Node,
+        value: float,
+        score: float = 0.0,
+    ) -> None:
+        """Propagate ``value``/``score`` (from ``leaf.to_play``'s perspective) up the path."""
         leaf.visits += 1
         leaf.value_sum += value
+        leaf.score_sum += score
         v = value
+        s = score
         for parent, child in reversed(path):
             v = -v  # flip to the parent's perspective
+            s = -s
             parent.visits += 1
             parent.value_sum += v
+            parent.score_sum += s
 
     # ------------------------------------------------------------------ search
     def run(self, playouts: int, max_time: Optional[float] = None) -> int:
@@ -260,7 +294,12 @@ class MCTS:
                 if leaf is None:
                     break
                 if leaf.is_terminal:
-                    self._backup(path, leaf, leaf.terminal_value)
+                    self._backup(
+                        path,
+                        leaf,
+                        leaf.terminal_value,
+                        terminal_score_of(leaf.position, leaf.to_play),
+                    )
                     terminal_leaves += 1
                     continue
                 leaf.pending = True
@@ -284,12 +323,14 @@ class MCTS:
                     policy = out.policy[i].astype(np.float64)
                     self._expand(leaf, policy)
                     value = float(out.value[i, 1] - out.value[i, 0])
-                    self._backup(path, leaf, value)
+                    score = float(np.dot(out.score[i], self._score_bins))
+                    self._backup(path, leaf, value, score)
                 done += len(batch) + terminal_leaves
             if max_time is not None and time.perf_counter() - start > max_time:
                 break
         if self.root is not None:
             self.root_value = self.root.mean_value
+            self.root_score = self.root.mean_score
         return done
 
     # --------------------------------------------------------------- read-out
